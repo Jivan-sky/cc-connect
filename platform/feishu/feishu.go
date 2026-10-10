@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -1003,7 +1004,16 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		// without an agent round-trip. Any failure falls back to normal dispatch.
 		if p.cardHookDir != "" {
 			if hookName, _ := event.Event.Action.Value["hook"].(string); hookName != "" {
-				cardMap, hookErr := p.runCardHook(hookName, event.Event.Action.Value)
+				caller := cardHookCaller{OpenID: userID, ChatID: chatID, MessageID: messageID}
+				if op := event.Event.Operator; op != nil {
+					if op.UserID != nil {
+						caller.UserID = *op.UserID
+					}
+					if op.TenantKey != nil {
+						caller.TenantKey = *op.TenantKey
+					}
+				}
+				cardMap, hookErr := p.runCardHook(hookName, event.Event.Action.Value, caller)
 				if hookErr != nil {
 					slog.Warn(p.tag()+": card hook failed", "hook", hookName, "error", hookErr)
 				} else if cardMap != nil {
@@ -1042,12 +1052,43 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 	return nil, nil
 }
 
+// cardHookCaller is "who clicked, and where". The button value alone cannot
+// answer that, yet a hook that acts on the click (approvals, voting, task
+// claiming) needs it to record the decision and to replace the right message.
+type cardHookCaller struct {
+	OpenID    string
+	UserID    string
+	TenantKey string
+	ChatID    string
+	MessageID string
+}
+
+// cardHookEnv renders the caller as environment variables. Empty values are
+// omitted, so a script can tell "not provided" from "provided empty" with
+// [ -n "$VAR" ] instead of guessing.
+func cardHookEnv(c cardHookCaller) []string {
+	env := make([]string, 0, 5)
+	add := func(key, val string) {
+		if val != "" {
+			env = append(env, key+"="+val)
+		}
+	}
+	add("CC_CARD_HOOK_OPERATOR_OPEN_ID", c.OpenID)
+	add("CC_CARD_HOOK_OPERATOR_USER_ID", c.UserID)
+	add("CC_CARD_HOOK_OPERATOR_TENANT_KEY", c.TenantKey)
+	add("CC_CARD_HOOK_CHAT_ID", c.ChatID)
+	add("CC_CARD_HOOK_MESSAGE_ID", c.MessageID)
+	return env
+}
+
 // runCardHook executes a local hook script from cardHookDir synchronously.
 // The full button value is passed as JSON on stdin; if stdout parses as a JSON
-// object it is returned as the raw replacement card. The caller treats any
-// error as "no card" and falls back to normal agent dispatch, so a broken or
-// slow hook (bounded by cardHookTimeout) never blocks message handling.
-func (p *Platform) runCardHook(name string, value map[string]any) (map[string]any, error) {
+// object it is returned as the raw replacement card. Who clicked, and which
+// chat/message the click came from, are passed as CC_CARD_HOOK_* environment
+// variables (see cardHookEnv). The caller treats any error as "no card" and
+// falls back to normal agent dispatch, so a broken or slow hook (bounded by
+// cardHookTimeout) never blocks message handling.
+func (p *Platform) runCardHook(name string, value map[string]any, caller cardHookCaller) (map[string]any, error) {
 	script, err := safeHookPath(p.cardHookDir, name)
 	if err != nil {
 		return nil, err
@@ -1060,6 +1101,7 @@ func (p *Platform) runCardHook(name string, value map[string]any) (map[string]an
 	}
 	cmd := exec.CommandContext(ctx, "bash", script)
 	cmd.Dir = p.cardHookDir
+	cmd.Env = append(os.Environ(), cardHookEnv(caller)...)
 	// If a killed hook leaves children holding the output pipes, Output() would
 	// block until they exit; WaitDelay caps that grace period so the timeout
 	// above actually holds.
